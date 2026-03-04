@@ -56,8 +56,8 @@ function makeStubPeerInfo(peerId, networkLength) {
     lastUpdate: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
     instId: makeInstId(),
     cost: 1,
-    hostname: "",
-    easytierVersion: "cf-ws-relay",
+    hostname: "CF-ETSV",
+    easytierVersion: "cf-et-ws",
     featureFlag: { isPublicServer: false, avoidRelayData: false, kcpInput: false, noRelayKcp: false },
     networkLength: Number(networkLength || 24),
     peerRouteId: randomU64String(),
@@ -81,12 +81,69 @@ export class PeerManager {
     this.myInfo = null; // lazily initialized to avoid random in global scope
     this.sessionTtlMs = Number(process.env.EASYTIER_SESSION_TTL_MS || 3 * 60 * 1000);
     this.lastSessionCleanup = 0;
+    this.lastPeerInfoCleanup = 0;
 
     this.pureP2PMode = (process.env.EASYTIER_DISABLE_RELAY === '1');
+    
+    // 启动定期清理任务
+    this._startCleanupTask();
   }
 
   setTypes(types) {
     this.types = types;
+  }
+
+  _startCleanupTask() {
+    // 每30秒清理一次已断开连接的设备信息
+    setInterval(() => {
+      this.cleanupStalePeerInfos();
+    }, 30000);
+  }
+
+  cleanupStalePeerInfos() {
+    const now = Date.now();
+    if (now - this.lastPeerInfoCleanup < 30000) {
+      return; // 30秒内只清理一次
+    }
+    this.lastPeerInfoCleanup = now;
+
+    let cleanedCount = 0;
+    
+    // 清理所有网络组中的陈旧设备信息
+    for (const [groupKey, peerInfos] of this.peerInfosByGroup.entries()) {
+      const activePeers = this._getPeersMap(groupKey, false);
+      if (!activePeers) continue;
+
+      for (const [peerId, peerInfo] of peerInfos.entries()) {
+        // 如果设备不在活跃列表中，清理其信息
+        if (!activePeers.has(peerId)) {
+          peerInfos.delete(peerId);
+          cleanedCount++;
+          console.log(`Cleaned stale peer info: ${peerId} from group ${groupKey}`);
+        }
+      }
+
+      // 如果网络组没有活跃设备，清理整个组
+      if (activePeers.size === 0) {
+        this.peerInfosByGroup.delete(groupKey);
+        this.peerConnVersions.delete(groupKey);
+        this.routeSessions.delete(groupKey);
+        console.log(`Cleaned empty group: ${groupKey}`);
+      }
+    }
+
+    if (cleanedCount > 0) {
+      console.log(`Cleaned ${cleanedCount} stale peer infos`);
+      
+      // 清理后广播路由更新
+      if (this.types) {
+        try {
+          this.broadcastRouteUpdate(this.types, undefined, undefined, { forceFull: true });
+        } catch (e) {
+          console.error(`Failed to broadcast after cleanup: ${e.message}`);
+        }
+      }
+    }
   }
 
   ensureMyInfo() {
@@ -103,9 +160,9 @@ export class PeerManager {
         noRelayKcp: false
       },
       networkLength: Number(process.env.EASYTIER_NETWORK_LENGTH || 24),
-      easytierVersion: process.env.EASYTIER_VERSION || "cf-ws-relay",
+      easytierVersion: process.env.EASYTIER_VERSION || "cf-et-ws",
       lastUpdate: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
-      hostname: process.env.EASYTIER_HOSTNAME || "PublicServer_WorkerRelay",
+      hostname: process.env.EASYTIER_HOSTNAME || "CF-ETSV",
       udpStunInfo: 0,
       peerRouteId: randomU64String(),
       groups: [],
@@ -303,8 +360,19 @@ export class PeerManager {
     const connVers = this._getPeerConnVersionMap(groupKey, false);
     if (connVers) connVers.delete(peerId);
 
+    // 强制触发完整路由更新，确保其他设备知道该设备已断开
     if (wasPresent && peers && peers.size > 0) {
       this.bumpAllPeerConnVersions(groupKey);
+      // 立即广播路由更新，确保断开信息及时传播
+      setTimeout(() => {
+        try {
+          if (this.types) {
+            this.broadcastRouteUpdate(this.types, groupKey, peerId, { forceFull: true });
+          }
+        } catch (e) {
+          console.error(`Failed to broadcast route update after peer removal: ${e.message}`);
+        }
+      }, 10);
     }
 
     if (peers && peers.size === 0) {
@@ -312,6 +380,8 @@ export class PeerManager {
       this.peerInfosByGroup.delete(groupKey);
       this.peerConnVersions.delete(groupKey);
     }
+    
+    console.log(`Peer ${peerId} removed from group ${groupKey}, wasPresent: ${wasPresent}`);
     return true;
   }
 
@@ -404,14 +474,26 @@ export class PeerManager {
     session.mySessionId = ws.serverSessionId;
     const forceFullLocal = forceFull || !session.dstSessionId;
 
-    const allPeers = new Set(this.listPeerIdsInGroup(groupKey));
+    // 只包含当前活跃的对等节点（已连接的设备）
+    const activePeers = new Set(this.listPeerIdsInGroup(groupKey));
     const infos = this._getPeerInfosMap(groupKey, false);
+    
+    // 过滤掉已断开连接的设备信息
+    const allPeers = new Set(activePeers); // 从活跃对等节点开始
     if (infos) {
       for (const pid of infos.keys()) {
-        allPeers.add(pid);
+        // 只保留当前活跃的设备信息
+        if (activePeers.has(pid)) {
+          allPeers.add(pid);
+        }
       }
     }
-    allPeers.add(targetPeerId);
+    
+    // 确保包含目标对等节点
+    if (targetPeerId) {
+      allPeers.add(targetPeerId);
+    }
+    
     const relevantPeers = [MY_PEER_ID, ...Array.from(allPeers).filter(p => p !== MY_PEER_ID).sort((a, b) => Number(a) - Number(b))];
     const defaultNetLen = myInfo.networkLength || 24;
 
