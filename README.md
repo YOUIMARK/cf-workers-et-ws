@@ -110,6 +110,7 @@ easytier-ws-relay/
 │   │   │   ├── packet.js           # 数据包处理
 │   │   │   ├── peer_manager.js     # 对等节点管理
 │   │   │   ├── protos.js           # Protobuf 相关功能
+│   │   │   ├── global_state.js     # 全局状态管理器
 │   │   │   ├── protos_generated.js # Protobuf 生成的代码
 │   │   │   └── rpc_handler.js      # RPC 处理器
 │   │   └── relay_room.js           # 中继房间实现
