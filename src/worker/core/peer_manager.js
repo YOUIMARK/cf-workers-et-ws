@@ -2,6 +2,7 @@ import { Buffer } from 'buffer';
 import { MY_PEER_ID, PacketType } from './constants.js';
 import { createHeader } from './packet.js';
 import { wrapPacket, randomU64String } from './crypto.js';
+import { getPeerCenterState, cleanPeerAndSubPeers } from './global_state.js';
 
 const WS_OPEN = 1; // WebSocket.OPEN in CF runtime
 
@@ -62,7 +63,7 @@ function makeStubPeerInfo(peerId, networkLength) {
     networkLength: Number(networkLength || 24),
     peerRouteId: randomU64String(),
     groups: [],
-    udpStunInfo: 0,
+    udpStunInfo: 1, // 默认设置为 OpenInternet，鼓励 P2P 打洞
   };
 }
 
@@ -81,69 +82,12 @@ export class PeerManager {
     this.myInfo = null; // lazily initialized to avoid random in global scope
     this.sessionTtlMs = Number(process.env.EASYTIER_SESSION_TTL_MS || 3 * 60 * 1000);
     this.lastSessionCleanup = 0;
-    this.lastPeerInfoCleanup = 0;
 
     this.pureP2PMode = (process.env.EASYTIER_DISABLE_RELAY === '1');
-    
-    // 启动定期清理任务
-    this._startCleanupTask();
   }
 
   setTypes(types) {
     this.types = types;
-  }
-
-  _startCleanupTask() {
-    // 每30秒清理一次已断开连接的设备信息
-    setInterval(() => {
-      this.cleanupStalePeerInfos();
-    }, 30000);
-  }
-
-  cleanupStalePeerInfos() {
-    const now = Date.now();
-    if (now - this.lastPeerInfoCleanup < 30000) {
-      return; // 30秒内只清理一次
-    }
-    this.lastPeerInfoCleanup = now;
-
-    let cleanedCount = 0;
-    
-    // 清理所有网络组中的陈旧设备信息
-    for (const [groupKey, peerInfos] of this.peerInfosByGroup.entries()) {
-      const activePeers = this._getPeersMap(groupKey, false);
-      if (!activePeers) continue;
-
-      for (const [peerId, peerInfo] of peerInfos.entries()) {
-        // 如果设备不在活跃列表中，清理其信息
-        if (!activePeers.has(peerId)) {
-          peerInfos.delete(peerId);
-          cleanedCount++;
-          console.log(`Cleaned stale peer info: ${peerId} from group ${groupKey}`);
-        }
-      }
-
-      // 如果网络组没有活跃设备，清理整个组
-      if (activePeers.size === 0) {
-        this.peerInfosByGroup.delete(groupKey);
-        this.peerConnVersions.delete(groupKey);
-        this.routeSessions.delete(groupKey);
-        console.log(`Cleaned empty group: ${groupKey}`);
-      }
-    }
-
-    if (cleanedCount > 0) {
-      console.log(`Cleaned ${cleanedCount} stale peer infos`);
-      
-      // 清理后广播路由更新
-      if (this.types) {
-        try {
-          this.broadcastRouteUpdate(this.types, undefined, undefined, { forceFull: true });
-        } catch (e) {
-          console.error(`Failed to broadcast after cleanup: ${e.message}`);
-        }
-      }
-    }
   }
 
   ensureMyInfo() {
@@ -163,7 +107,7 @@ export class PeerManager {
       easytierVersion: process.env.EASYTIER_VERSION || "cf-et-ws",
       lastUpdate: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
       hostname: process.env.EASYTIER_HOSTNAME || "CF-ETSV",
-      udpStunInfo: 0,
+      udpStunInfo: 1, // 服务器设置为 OpenInternet，支持 P2P 打洞
       peerRouteId: randomU64String(),
       groups: [],
     };
@@ -321,16 +265,26 @@ export class PeerManager {
 
   onRouteSessionAck(groupKey, peerId, theirSessionId, weAreInitiator) {
     const s = this._getSession(groupKey, peerId, true);
-    if (s.dstSessionId !== theirSessionId) {
+    const isNewSession = s.dstSessionId !== theirSessionId;
+    
+    if (isNewSession) {
+      console.log(`[SessionAck] New session detected for peer ${peerId}, resetting all version info`);
       s.peerInfoVerMap.clear();
       s.connBitmapVerMap.clear();
       s.foreignNetVer = 0;
       s.lastConnBitmapSig = null;
+      
+      // 强制重置连接版本，确保重连后能获取完整的连接位图
+      const connVersions = this._getPeerConnVersionMap(groupKey, true);
+      connVersions.set(peerId, 1); // 重置为初始版本
     }
+    
     s.dstSessionId = theirSessionId;
     if (typeof weAreInitiator === 'boolean') {
       s.weAreInitiator = weAreInitiator;
     }
+    
+    console.log(`[SessionAck] Session updated for peer ${peerId}: newSession=${isNewSession}, weAreInitiator=${weAreInitiator}`);
   }
 
   addPeer(peerId, ws) {
@@ -347,6 +301,14 @@ export class PeerManager {
     const peerId = ws && ws.peerId;
     const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
     if (!peerId) return false;
+    
+    // 清理全局状态中的子设备信息
+    try {
+      cleanPeerAndSubPeers(groupKey, peerId);
+    } catch (e) {
+      console.warn(`[PeerCleanup] Failed to clean global state for peer ${peerId}:`, e.message);
+    }
+    
     const peers = this._getPeersMap(groupKey, false);
     const wasPresent = peers && peers.has(peerId);
     if (peers) peers.delete(peerId);
@@ -360,19 +322,8 @@ export class PeerManager {
     const connVers = this._getPeerConnVersionMap(groupKey, false);
     if (connVers) connVers.delete(peerId);
 
-    // 强制触发完整路由更新，确保其他设备知道该设备已断开
     if (wasPresent && peers && peers.size > 0) {
       this.bumpAllPeerConnVersions(groupKey);
-      // 立即广播路由更新，确保断开信息及时传播
-      setTimeout(() => {
-        try {
-          if (this.types) {
-            this.broadcastRouteUpdate(this.types, groupKey, peerId, { forceFull: true });
-          }
-        } catch (e) {
-          console.error(`Failed to broadcast route update after peer removal: ${e.message}`);
-        }
-      }, 10);
     }
 
     if (peers && peers.size === 0) {
@@ -381,7 +332,7 @@ export class PeerManager {
       this.peerConnVersions.delete(groupKey);
     }
     
-    console.log(`Peer ${peerId} removed from group ${groupKey}, wasPresent: ${wasPresent}`);
+    console.log(`[PeerCleanup] Successfully removed peer ${peerId} from group ${groupKey}`);
     return true;
   }
 
@@ -474,43 +425,75 @@ export class PeerManager {
     session.mySessionId = ws.serverSessionId;
     const forceFullLocal = forceFull || !session.dstSessionId;
 
-    // 只包含当前活跃的对等节点（已连接的设备）
-    const activePeers = new Set(this.listPeerIdsInGroup(groupKey));
+    // 收集所有相关的 peer，包括子设备
+    const allPeers = new Set(this.listPeerIdsInGroup(groupKey));
     const infos = this._getPeerInfosMap(groupKey, false);
-    
-    // 过滤掉已断开连接的设备信息
-    const allPeers = new Set(activePeers); // 从活跃对等节点开始
     if (infos) {
       for (const pid of infos.keys()) {
-        // 只保留当前活跃的设备信息
-        if (activePeers.has(pid)) {
-          allPeers.add(pid);
-        }
+        allPeers.add(pid);
       }
     }
     
-    // 确保包含目标对等节点
-    if (targetPeerId) {
-      allPeers.add(targetPeerId);
+    // 添加全局 peer 映射中的子设备
+    try {
+      const globalState = getPeerCenterState(groupKey);
+      for (const [peerId, peerInfo] of globalState.globalPeerMap.entries()) {
+        allPeers.add(Number(peerId));
+        if (peerInfo.directPeers) {
+          for (const subPeerId of Object.keys(peerInfo.directPeers)) {
+            allPeers.add(Number(subPeerId));
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(`Failed to get global peer state for group ${groupKey}:`, e.message);
     }
     
+    allPeers.add(targetPeerId);
     const relevantPeers = [MY_PEER_ID, ...Array.from(allPeers).filter(p => p !== MY_PEER_ID).sort((a, b) => Number(a) - Number(b))];
     const defaultNetLen = myInfo.networkLength || 24;
+    
+    console.log(`[RouteUpdate] Pushing route update to ${targetPeerId} with ${relevantPeers.length} peers (including sub-peers)`);
 
     const peerInfosItems = [];
     for (const pid of relevantPeers) {
       let info = (pid === MY_PEER_ID)
         ? myInfo
         : (this._getPeerInfosMap(groupKey, false)?.get(pid));
-      if (!info) {
+      
+      // 只推送实际存在的 peer 信息，避免为不存在的子设备创建 stub 信息
+      if (!info && pid !== MY_PEER_ID) {
+        // 检查是否是全局状态中记录的子设备
+        try {
+          const globalState = getPeerCenterState(groupKey);
+          const isKnownSubPeer = Array.from(globalState.globalPeerMap.values()).some(peerInfo => 
+            peerInfo.directPeers && String(pid) in peerInfo.directPeers
+          );
+          
+          if (!isKnownSubPeer) {
+            console.log(`[RouteUpdate] Skipping unknown sub-peer ${pid} in route update`);
+            continue; // 跳过未知的子设备
+          }
+        } catch (e) {
+          console.warn(`[RouteUpdate] Failed to check global state for peer ${pid}:`, e.message);
+          continue; // 出错时跳过
+        }
+        
+        // 对于已知的子设备，创建临时信息但不保存到本地映射
         info = makeStubPeerInfo(pid, defaultNetLen);
-        this._getPeerInfosMap(groupKey, true).set(pid, info);
+        console.log(`[RouteUpdate] Created temporary info for known sub-peer ${pid}`);
       }
+      
+      if (!info) continue; // 确保 info 存在
+      
       const version = info && info.version ? info.version : 1;
       const prev = forceFullLocal ? 0 : (session.peerInfoVerMap.get(pid) || 0);
+      
+      // 强制推送或版本变化时包含该 peer 信息
       if (forceFullLocal || version > prev) {
         peerInfosItems.push(info);
         session.peerInfoVerMap.set(pid, version);
+        console.log(`[RouteUpdate] Including peer ${pid} in update, forceFull=${forceFullLocal}, version=${version} > prev=${prev}`);
       }
     }
 
@@ -532,31 +515,29 @@ export class PeerManager {
         const idx = row * N + col;
         bitmap[Math.floor(idx / 8)] |= (1 << (idx % 8));
       };
+      
+      // 设置所有 peer 之间的连接性（全连接拓扑）
+      // 这样所有 peer 都会尝试进行 P2P 打洞
       for (let i = 0; i < peerIdVersions.length; i++) {
-        setBit(i, i);
-      }
-      const serverIdx = idxByPeerId.get(MY_PEER_ID);
-      if (serverIdx !== undefined) {
-        for (let i = 0; i < peerIdVersions.length; i++) {
-          if (i === serverIdx) continue;
-          setBit(serverIdx, i);
-          setBit(i, serverIdx);
-        }
-      } else {
-        for (let i = 0; i < peerIdVersions.length; i++) {
-          for (let j = 0; j < peerIdVersions.length; j++) {
-            setBit(i, j);
-          }
+        for (let j = 0; j < peerIdVersions.length; j++) {
+          setBit(i, j);
         }
       }
+      
+      console.log(`[ConnBitmap] Created full-mesh connectivity for ${peerIdVersions.length} peers`);
       const bitmapBuf = Buffer.from(bitmap);
       const sig = `${peerIdVersions.map(p => `${p.peerId}:${p.version}`).join(',')}|${bitmapBuf.toString('hex')}`;
       const connVersion = session.connBitmapVerMap.get(targetPeerId) || 0;
       const nextConnVersion = connVersion || Math.max(...peerIdVersions.map(p => p.version));
-      if (sig !== session.lastConnBitmapSig) {
+      
+      // 强制推送或签名变化时生成新的连接位图
+      if (forceFullLocal || sig !== session.lastConnBitmapSig) {
         session.connBitmapVerMap.set(targetPeerId, nextConnVersion);
         session.lastConnBitmapSig = sig;
         connBitmap = { peerIds: peerIdVersions, bitmap: bitmapBuf, version: nextConnVersion };
+        console.log(`[ConnBitmap] Generated new bitmap for peer ${targetPeerId}, forceFull=${forceFullLocal}`);
+      } else {
+        console.log(`[ConnBitmap] Using cached bitmap for peer ${targetPeerId}, sig unchanged`);
       }
     }
 
