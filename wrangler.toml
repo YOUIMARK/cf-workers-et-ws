@@ -13,7 +13,7 @@ EASYTIER_DISABLE_RELAY = "0"
 
 EASYTIER_COMPRESS_RPC = "1"
 
-# Workers地域
+# Workers地域，参考README.md
 LOCATION_HINT = "apac"
 
 # 私有模式：填入与客户端相同的网络名称。留空则允许任何人连接
