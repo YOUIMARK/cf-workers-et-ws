@@ -4,12 +4,27 @@ compatibility_date = "2024-11-01"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
+
+# ws目录
 WS_PATH = "ws"
+
+# 转发，0为关闭，1为开启
 EASYTIER_DISABLE_RELAY = "0"
+
 EASYTIER_COMPRESS_RPC = "1"
+
+# Workers地域
 LOCATION_HINT = "apac"
-EASYTIER_HEARTBEAT_INTERVAL = "25000"
-EASYTIER_CONNECTION_TIMEOUT = "60000"
+
+# 私有模式：填入与客户端相同的网络名称。留空则允许任何人连接
+EASYTIER_NETWORK_NAME = ""
+
+# 延迟优先模式：设为 "1" 开启，开启后中继发出的包会带上特权标志位，加速路由收敛
+EASYTIER_LATENCY_FIRST = "1"
+
+# 心跳与超时配置（缩短时间，解决节点不消失的问题）
+EASYTIER_HEARTBEAT_INTERVAL = "10000" # 10秒发一次心跳
+EASYTIER_CONNECTION_TIMEOUT = "25000" # 25秒无响应则踢出
 EASYTIER_SESSION_TTL_MS = "180000"
 
 [durable_objects]
