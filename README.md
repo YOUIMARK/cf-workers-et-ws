@@ -39,7 +39,7 @@
 
 ### 一键安装
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=[https://github.com/Teleseon/cf-workers-et-ws])
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Teleseon/cf-workers-et-ws)
 
 ### 手动安装步骤
 
