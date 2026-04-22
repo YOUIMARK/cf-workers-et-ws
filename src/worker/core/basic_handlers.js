@@ -1,16 +1,17 @@
 /**
  * EasyTier 基础消息处理器
- * 
- * 本文件实现了握手处理、私有网络支持和网络组管理功能
- * 核心改进：实现私有模式拦截和更好的客户端兼容性
- * 
- * 核心功能：
- * - 私有网络支持：通过环境变量配置私有网络名
- * - 握手协议优化：移除features字段提升兼容性
- * - 网络组管理：支持多密码和网络组活动状态跟踪
- * 
- * @file basic_handlers.js
- * @version 2.0.0
+ *
+ * 修复列表:
+ * [H1] handleHandshake: 握手完成设置 peerId/groupKey 后立即重新调用
+ *      serializeAttachment, 确保 DO 休眠恢复后 peer 不丢失。
+ * [H4] 私有模式从 ws._env (CF env 绑定) 读取, 不再读 process.env。
+ * [H3] isPublicServer 始终响应为 true, 防止 EasyTier 客户端触发 SecretKeyError。
+ * [H7] catch 块: 先确认 e.message 存在再调用 includes, 修复运算符优先级 TypeError。
+ * [H9] handleForwarding 转发失败时执行完整清理 (clearInterval + isCleanedUp +
+ *      removeNetworkGroupActivity + removePeer), 不再绕过 _cleanup 导致资源泄漏。
+ * [ND] 移除握手响应的 10ms setTimeout (CF Workers 无需等待客户端准备好)。
+ * [NR] removeNetworkGroupActivity: 同步清理 networkDigestRegistry, 防止无界内存积累。
+ * [BC] broadcastRouteUpdate 失败后使用 forceFull:false, 避免高频失败时广播风暴。
  */
 
 import { MAGIC, VERSION, MY_PEER_ID, PacketType } from './constants.js';
@@ -20,230 +21,207 @@ import { wrapPacket, randomU64String } from './crypto.js';
 
 const WS_OPEN = (typeof WebSocket !== 'undefined' && WebSocket.OPEN) ? WebSocket.OPEN : 1;
 
-// 支持多密码：每个网络名称可以对应多个密码摘要
-const networkDigestRegistry = new Map(); // networkName -> Set of digests
-const networkGroups = new Map(); // networkName:digest -> group metadata
+/** networkName -> Set<digestHex> */
+const networkDigestRegistry = new Map();
+/** groupKey (networkName:digestHex) -> { createdAt, peerCount, lastActivity } */
+const networkGroups = new Map();
 
-// 网络组管理功能
-function updateNetworkGroupActivity(groupKey) {
-  const group = networkGroups.get(groupKey);
-  if (group) {
-    group.lastActivity = Date.now();
-    group.peerCount = (group.peerCount || 0) + 1;
-  }
+export function updateNetworkGroupActivity(groupKey) {
+  const g = networkGroups.get(groupKey);
+  if (g) { g.lastActivity = Date.now(); g.peerCount = (g.peerCount || 0) + 1; }
 }
 
-function removeNetworkGroupActivity(groupKey) {
-  const group = networkGroups.get(groupKey);
-  if (group) {
-    group.peerCount = Math.max(0, (group.peerCount || 1) - 1);
-    
-    // 如果网络组没有活跃的对等节点，可以清理（可选）
-    if (group.peerCount === 0 && Date.now() - group.lastActivity > 24 * 60 * 60 * 1000) {
-      // 24小时无活动，清理网络组
-      networkGroups.delete(groupKey);
-      console.log(`Cleaned up inactive network group: ${groupKey}`);
+export function removeNetworkGroupActivity(groupKey) {
+  const g = networkGroups.get(groupKey);
+  if (!g) return;
+  g.peerCount = Math.max(0, (g.peerCount || 1) - 1);
+  if (g.peerCount === 0 && Date.now() - g.lastActivity > 24 * 60 * 60 * 1000) {
+    networkGroups.delete(groupKey);
+    // [NR] 同步清理 networkDigestRegistry, 防止无界内存积累
+    for (const [netName, digests] of networkDigestRegistry.entries()) {
+      const prefix = `${netName}:`;
+      if (groupKey.startsWith(prefix)) {
+        const digestHex = groupKey.slice(prefix.length);
+        digests.delete(digestHex);
+        if (digests.size === 0) networkDigestRegistry.delete(netName);
+        break;
+      }
     }
+    console.log(`[NetworkGroup] Cleaned up inactive group: ${groupKey}`);
   }
 }
 
-function getNetworkGroupsByNetwork(networkName) {
+export function getNetworkGroupsByNetwork(networkName) {
   const groups = [];
-  for (const [groupKey, group] of networkGroups.entries()) {
-    if (groupKey.startsWith(`${networkName}:`)) {
-      groups.push({
-        groupKey,
-        ...group
-      });
-    }
+  for (const [groupKey, g] of networkGroups.entries()) {
+    if (groupKey.startsWith(`${networkName}:`)) groups.push({ groupKey, ...g });
   }
   return groups;
 }
 
-function handleHandshake(ws, header, payload, types) {
+// ── 握手处理 ─────────────────────────────────────────────────────────────────
+
+export function handleHandshake(ws, header, payload, types) {
   try {
     const req = types.HandshakeRequest.decode(payload);
 
-    if (req.magic !== MAGIC) {
-      ws.close();
-      return;
-    }
+    if (req.magic !== MAGIC) { ws.close(); return; }
 
     const clientNetworkName = req.networkName || '';
-    
-    // 【新增功能】：私有模式拦截
-    // 如果 Worker 配置了私有网络名，且客户端请求的网络名不一致，直接拒绝连接
-    const privateNetworkName = process.env.EASYTIER_NETWORK_NAME || '';
+
+    // [H4] 从 ws._env (CF env 绑定) 读取; process.env 在 CF Workers 中不包含 [vars]
+    const env                = ws._env || {};
+    const privateNetworkName = env.EASYTIER_NETWORK_NAME || '';
     if (privateNetworkName && clientNetworkName !== privateNetworkName) {
-      console.error(`[Private Mode] Rejected: Expected ${privateNetworkName}, got ${clientNetworkName}`);
-      ws.close(1008, "Network name mismatch");
+      console.error(`[Private Mode] Rejected: expected "${privateNetworkName}", got "${clientNetworkName}"`);
+      ws.close(1008, 'Network name mismatch');
       return;
     }
 
-    // 根据是否配置了私有网络名，判断是否为公开服务器
-    const isPublicServer = !privateNetworkName;
-    const serverNetworkName = privateNetworkName || process.env.EASYTIER_PUBLIC_SERVER_NETWORK_NAME || 'public_server';
+    // [H3] 始终以公开服务器身份响应。
+    // EasyTier 客户端在 isPublicServer=true 时跳过 networkName 校验,
+    // 若响应 isPublicServer=false 则触发 SecretKeyError。
+    // 私有模式拦截 (上方) 已提前拒绝不匹配的连接, 此处保持协议兼容。
+    const isPublicServer    = true;
+    const serverNetworkName = 'public_server';
 
-    // ... (中间的 networkDigestRegistry 等逻辑保持原版不变) ...
-
-    const clientDigest = req.networkSecretDigrest ? Buffer.from(req.networkSecretDigrest) : Buffer.alloc(0);
+    const clientDigest = req.networkSecretDigrest
+      ? Buffer.from(req.networkSecretDigrest)
+      : Buffer.alloc(0);
     const digestHex = clientDigest.toString('hex');
-    
-    // 支持多密码：检查该网络名称下是否已存在此密码摘要
+
     let existingDigests = networkDigestRegistry.get(clientNetworkName);
     if (!existingDigests) {
       existingDigests = new Set();
       networkDigestRegistry.set(clientNetworkName, existingDigests);
     }
-    
-    // 如果密码摘要不为空且不在现有摘要集合中，则创建新的网络组
     if (digestHex.length > 0 && !existingDigests.has(digestHex)) {
       existingDigests.add(digestHex);
-      console.log(`Adding new digest for network "${clientNetworkName}": ${digestHex}`);
+      console.log(`[Handshake] New digest for network "${clientNetworkName}": ${digestHex}`);
     }
-    
-    // 生成网络组键：网络名称:密码摘要
+
     const groupKey = `${clientNetworkName}:${digestHex}`;
-    
-    // 初始化网络组元数据（如果不存在）
     if (!networkGroups.has(groupKey)) {
-      networkGroups.set(groupKey, {
-        createdAt: Date.now(),
-        peerCount: 0,
-        lastActivity: Date.now()
-      });
-      console.log(`Created new network group: ${groupKey}`);
+      networkGroups.set(groupKey, { createdAt: Date.now(), peerCount: 0, lastActivity: Date.now() });
+      console.log(`[Handshake] Created network group: ${groupKey}`);
     }
 
     ws.domainName = clientNetworkName;
+    ws.groupKey   = groupKey;
+    ws.peerId     = req.myPeerId;
 
-    // 【关键修复 5】：移除 features 字段，防止官方客户端严格校验导致拒收
-    const respPayload = {
-      magic: MAGIC,
-      myPeerId: MY_PEER_ID,
-      version: VERSION,
-      networkName: serverNetworkName,
-      networkSecretDigrest: new Uint8Array(32) // 注意这里官方 proto 拼写是 Digrest
-    };
-    
-    console.log(`Handshake response payload:`, {
-      magic: respPayload.magic,
-      myPeerId: respPayload.myPeerId,
-      version: respPayload.version,
-      networkName: respPayload.networkName,
-      networkSecretDigrestLength: respPayload.networkSecretDigrest ? respPayload.networkSecretDigrest.length : 0
+    // [H1] 握手完成后重新序列化, 确保 DO 休眠恢复时 peerId/groupKey 不丢失。
+    // _initSocket 调用时 peerId/groupKey 为 null, 初始序列化写入了空值。
+    ws.serializeAttachment?.({
+      peerId:          ws.peerId,
+      groupKey:        ws.groupKey,
+      domainName:      ws.domainName,
+      serverSessionId: ws.serverSessionId,
     });
 
-    ws.groupKey = groupKey;
-    ws.peerId = req.myPeerId;
     const pm = getPeerManager();
     pm.addPeer(req.myPeerId, ws);
-    
-    // 更新网络组活动状态
     updateNetworkGroupActivity(groupKey);
     pm.updatePeerInfo(ws.groupKey, req.myPeerId, {
-      peerId: req.myPeerId,
-      version: 1,
-      lastUpdate: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
-      instId: { part1: 0, part2: 0, part3: 0, part4: 0 },
-      networkLength: Number(process.env.EASYTIER_NETWORK_LENGTH || 24),
+      peerId:       req.myPeerId,
+      version:      1,
+      lastUpdate:   { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
+      instId:       { part1: 0, part2: 0, part3: 0, part4: 0 },
+      networkLength: Number(env.EASYTIER_NETWORK_LENGTH || 24),
     });
-    // 【修改】：使用动态的公开服务器标志
     pm.setPublicServerFlag(isPublicServer);
-    ws.crypto = { enabled: false };
+    ws.crypto          = { enabled: false };
+    ws.weAreInitiator  = ws.weAreInitiator !== undefined ? ws.weAreInitiator : false;
 
+    // [ND] 移除 10ms 延迟, 直接发送握手响应
+    if (ws.readyState !== WS_OPEN) {
+      console.error(`[Handshake] WS not open for peer ${req.myPeerId}, state: ${ws.readyState}`);
+      return;
+    }
+    const respPayload = {
+      magic:                MAGIC,
+      myPeerId:             MY_PEER_ID,
+      version:              VERSION,
+      networkName:          serverNetworkName,
+      networkSecretDigrest: new Uint8Array(32),
+    };
     const respBuffer = types.HandshakeRequest.encode(respPayload).finish();
     const respHeader = createHeader(MY_PEER_ID, req.myPeerId, PacketType.HandShake, respBuffer.length);
-    
-    // 改进发送逻辑：添加延迟确保客户端准备好接收
-    setTimeout(() => {
-      try {
-        // 检查连接状态
-        if (ws.readyState !== WS_OPEN) {
-          console.error(`WebSocket not open when sending handshake response to ${req.myPeerId}, state: ${ws.readyState}`);
-          return;
-        }
-        
-        ws.send(Buffer.concat([respHeader, Buffer.from(respBuffer)]));
-        console.log(`Handshake response sent to peer ${req.myPeerId}, payload length: ${respBuffer.length}`);
-      } catch (sendError) {
-        console.error(`Failed to send handshake response to ${req.myPeerId}:`, sendError);
-        // 不立即关闭连接，让心跳机制处理
-      }
-    }, 10); // 10ms延迟确保客户端准备好
-    
-    if (!ws.serverSessionId) {
-      ws.serverSessionId = randomU64String();
-    }
-    if (ws.weAreInitiator === undefined) {
-      ws.weAreInitiator = false;
+    try {
+      ws.send(Buffer.concat([respHeader, Buffer.from(respBuffer)]));
+      console.log(`[Handshake] Response sent to peer ${req.myPeerId}`);
+    } catch (sendErr) {
+      console.error(`[Handshake] Send failed for peer ${req.myPeerId}:`, sendErr);
+      return;
     }
 
+    // 50ms 后推送初始路由 (避免在握手帧尾立刻推大包)
     setTimeout(() => {
       try {
         if (ws.readyState === WS_OPEN) {
-          const pm = getPeerManager();
-          
-          // 为新设备推送完整的路由信息
           pm.pushRouteUpdateTo(req.myPeerId, ws, types, { forceFull: true });
-          
-          // 为所有现有设备广播路由更新，包括新设备
-          // 确保所有设备都能获得最新的连接位图
           pm.broadcastRouteUpdate(types, ws.groupKey, null, { forceFull: true });
-          
-          console.log(`[Handshake] Initial route updates completed for peer ${req.myPeerId}`);
+          console.log(`[Handshake] Initial route updates sent to peer ${req.myPeerId}`);
         }
       } catch (e) {
-        console.error(`Failed to push initial route update to ${req.myPeerId}:`, e.message);
+        console.error(`[Handshake] Initial route update failed for ${req.myPeerId}:`, e.message);
       }
     }, 50);
 
   } catch (e) {
-    console.error('Handshake error:', e);
-    // 改进错误处理：只在严重错误时关闭连接
-    if (e.message && e.message.includes('decode') || e.message.includes('Invalid')) {
-      ws.close();
-    }
-    // 其他错误不关闭连接，让心跳机制处理
+    console.error('[Handshake] Error:', e);
+    // [H7] 先确认 e.message 存在, 再调用 includes。
+    // 原版 `e.message && A || B` 中 B 在 e.message 为 undefined 时直接执行, 抛 TypeError。
+    const msg = (e && e.message) ? e.message : '';
+    if (msg.includes('decode') || msg.includes('Invalid')) ws.close();
+    // 其他错误不立即关闭, 由心跳机制处理
   }
 }
 
-function handlePing(ws, header, payload) {
+// ── Ping 处理 ────────────────────────────────────────────────────────────────
+
+export function handlePing(ws, header, payload) {
   const msg = wrapPacket(createHeader, MY_PEER_ID, header.fromPeerId, PacketType.Pong, payload, ws);
   ws.send(msg);
 }
 
-function handleForwarding(sourceWs, header, fullMessage, types) {
-  const targetPeerId = header.toPeerId;
-  const pm = getPeerManager();
-  const targetWs = pm.getPeerWs(targetPeerId, sourceWs && sourceWs.groupKey);
+// ── 转发处理 ─────────────────────────────────────────────────────────────────
 
-  if (targetWs && targetWs.readyState === WS_OPEN) {
-    const srcGroup = sourceWs && sourceWs.groupKey;
-    const dstGroup = targetWs && targetWs.groupKey;
-    if (srcGroup && dstGroup && srcGroup !== dstGroup) {
-      return;
+/**
+ * [H9] 转发失败时执行完整清理序列, 不再绕过 relay_room._cleanup:
+ *   1. clearInterval (heartbeatInterval)
+ *   2. isCleanedUp = true (防止后续 close 事件重复清理)
+ *   3. removeNetworkGroupActivity (恢复 peerCount)
+ *   4. removePeer (从 Map 中移除)
+ *   5. broadcastRouteUpdate forceFull:false (incremental, 版本已 bump)
+ */
+export function handleForwarding(sourceWs, header, fullMessage, types) {
+  const pm       = getPeerManager();
+  const targetWs = pm.getPeerWs(header.toPeerId, sourceWs && sourceWs.groupKey);
+  if (!targetWs || targetWs.readyState !== WS_OPEN) return;
+
+  const srcGroup = sourceWs && sourceWs.groupKey;
+  const dstGroup = targetWs.groupKey;
+  if (srcGroup && dstGroup && srcGroup !== dstGroup) {
+    console.warn(`[Forward] Cross-group blocked: ${srcGroup} -> ${dstGroup}`);
+    return;
+  }
+
+  try {
+    targetWs.send(fullMessage);
+  } catch (e) {
+    console.error(`[Forward] Failed to peer ${header.toPeerId}: ${e.message}`);
+    // [H9] 完整清理序列
+    if (targetWs.heartbeatInterval) {
+      clearInterval(targetWs.heartbeatInterval);
+      targetWs.heartbeatInterval = null;
     }
-    try {
-      targetWs.send(fullMessage);
-    } catch (e) {
-      console.error(`Forward to ${targetPeerId} failed: ${e.message}`);
-      pm.removePeer(targetWs);
-      try {
-        pm.broadcastRouteUpdate(types, srcGroup);
-      } catch (err) {
-        console.error(`Broadcast after forward failure failed: ${err.message}`);
-      }
+    targetWs.isCleanedUp = true;
+    if (targetWs.groupKey) {
+      try { removeNetworkGroupActivity(targetWs.groupKey); } catch (_) {}
     }
-  } else {
+    pm.removePeer(targetWs);
+    // [BC] forceFull:false — removePeer 已 bumpAllPeerConnVersions, 增量更新即可
+    try { pm.broadcastRouteUpdate(types, srcGroup, null, { forceFull: false }); } catch (_) {}
   }
 }
-
-export {
-  handleHandshake,
-  handlePing,
-  handleForwarding,
-  updateNetworkGroupActivity,
-  removeNetworkGroupActivity,
-  getNetworkGroupsByNetwork
-};
