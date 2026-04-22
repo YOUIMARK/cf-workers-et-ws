@@ -1,5 +1,7 @@
 # EasyTier WebSocket for Cloudflare Workers
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/YOUIMARK/cf-workers-et-ws)
+
 ## 项目简介
 
 该项目是 EasyTier 的第三方服务端实现。EasyTier 是一个去中心化 P2P 组网程序，官方代码使用 Rust 实现。本项目使用 Cloudflare Worker + Durable Object 实现了 JavaScript 版本的 WebSocket 服务端，支持网络转发与 P2P 打洞信息交换。
