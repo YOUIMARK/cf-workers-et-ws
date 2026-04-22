@@ -41,7 +41,7 @@
 
 ### 一键安装
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Teleseon/cf-workers-et-ws)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/YOUIMARK/cf-workers-et-ws)
 
 Deploy环境变量调整说明见 环境变量配置 部分
 
