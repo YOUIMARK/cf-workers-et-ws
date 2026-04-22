@@ -1,24 +1,24 @@
 /**
- * EasyTier WebSocket 中继房间实现
- * 
- * 本文件实现了 WebSocket 连接管理、心跳检测和断线清理功能
- * 主要修复了原版存在的"幽灵节点"问题，实现了秒级断线检测和实时设备列表刷新
- * 
- * 核心改进：
- * - 心跳机制优化：10秒心跳间隔，25秒超时判定
- * - 主动清理机制：超时后立即触发全局网络清理  
- * - 防抖保护：防止重复清理导致的广播风暴
- * - 0值绕过修复：避免从未发过Pong的死连接成为永久幽灵
- * 
- * @file relay_room.js
- * @version 2.0.0
+ * EasyTier WebSocket 中继房间 (Durable Object)
+ *
+ * 修复列表:
+ * [wsPath]    fetch(): 修复 '/' + env.WS_PATH || '/ws' 运算符优先级错误。
+ * [setEnv]    构造函数调用 peerManager.setEnv(env), 注入 CF env 绑定。
+ * [Hibernate] 批量恢复期间设 _inHibernationRestore, 恢复后统一 bump 一次版本号。
+ * [ws._env]   _initSocket 将 CF env 存入 ws._env, 供下游读取配置。
+ * [M1]        _cleanup: removeNetworkGroupActivity 提前到 peerId 守卫之前。
+ * [M3]        _sendPing: 握手未完成 (!ws.peerId) 时跳过, 避免向 toPeerId=0 发噪音包。
+ * [HB-env]    _startHeartbeat: 从 env 读取心跳间隔和超时, 原版硬编码忽略 wrangler.toml 配置。
  */
 
 import { Buffer } from 'buffer';
 import { parseHeader, createHeader } from './core/packet.js';
 import { PacketType, HEADER_SIZE, MY_PEER_ID } from './core/constants.js';
 import { loadProtos } from './core/protos.js';
-import { handleHandshake, handlePing, handleForwarding, updateNetworkGroupActivity, removeNetworkGroupActivity } from './core/basic_handlers.js';
+import {
+  handleHandshake, handlePing, handleForwarding,
+  updateNetworkGroupActivity, removeNetworkGroupActivity
+} from './core/basic_handlers.js';
 import { handleRpcReq, handleRpcResp } from './core/rpc_handler.js';
 import { getPeerManager } from './core/peer_manager.js';
 import { randomU64String } from './core/crypto.js';
@@ -27,64 +27,61 @@ const WS_OPEN = (typeof WebSocket !== 'undefined' && WebSocket.OPEN) ? WebSocket
 
 export class RelayRoom {
   constructor(state, env) {
-    this.state = state;
-    this.env = env;
-    this.types = loadProtos();
+    this.state       = state;
+    this.env         = env;
+    this.types       = loadProtos();
     this.peerManager = getPeerManager();
     this.peerManager.setTypes(this.types);
 
-    // Restore sockets after hibernation to keep metadata
-    this.state.getWebSockets().forEach((ws) => this._restoreSocket(ws));
+    // [setEnv] CF env 绑定注入 PeerManager
+    this.peerManager.setEnv(env);
+
+    // [Hibernate] 批量恢复: 恢复期间跳过逐 peer bump, 恢复后按 group 统一 bump 一次
+    this.peerManager._inHibernationRestore = true;
+    const restoredGroups = new Set();
+    this.state.getWebSockets().forEach(ws => {
+      this._restoreSocket(ws);
+      if (ws.groupKey) restoredGroups.add(String(ws.groupKey));
+    });
+    this.peerManager._inHibernationRestore = false;
+    for (const gk of restoredGroups) this.peerManager.bumpAllPeerConnVersions(gk);
   }
 
   async fetch(request) {
     const url = new URL(request.url);
-    const wsPath = '/' + this.env.WS_PATH || '/ws';
-    if (url.pathname !== wsPath) {
-      return new Response('Not found', { status: 404 });
-    }
-    if (request.headers.get('Upgrade') !== 'websocket') {
-      return new Response('Expected websocket', { status: 400 });
-    }
+    // [wsPath] 修复运算符优先级错误
+    const wsPath = this.env.WS_PATH ? `/${this.env.WS_PATH}` : '/ws';
+    if (url.pathname !== wsPath) return new Response('Not found', { status: 404 });
+    if (request.headers.get('Upgrade') !== 'websocket') return new Response('Expected websocket', { status: 400 });
 
     const pair = new WebSocketPair();
-    const server = pair[1];
-    const client = pair[0];
-    await this.handleSession(server);
-
-    return new Response(null, { status: 101, webSocket: client });
-  }
-
-  async handleSession(webSocket) {
-    this.state.acceptWebSocket(webSocket);
-    this._initSocket(webSocket);
+    this.state.acceptWebSocket(pair[1]);
+    this._initSocket(pair[1]);
+    return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
   async webSocketMessage(ws, message) {
     try {
-      let buffer = null;
-      if (message instanceof ArrayBuffer) {
-        buffer = Buffer.from(message);
-      } else if (message instanceof Uint8Array) {
-        buffer = Buffer.from(message);
-      } else if (ArrayBuffer.isView(message) && message.buffer) {
-        buffer = Buffer.from(message.buffer);
+      let buffer;
+      if      (message instanceof ArrayBuffer)                       buffer = Buffer.from(message);
+      else if (message instanceof Uint8Array)                        buffer = Buffer.from(message);
+      else if (ArrayBuffer.isView(message) && message.buffer)        buffer = Buffer.from(message.buffer);
+      else if (typeof message === 'string') {
+        // EasyTier 协议仅使用二进制帧; 文本帧表示客户端配置有误
+        console.warn(`[ws] TEXT frame from peer ${ws.peerId} — EasyTier uses binary frames only`);
+        return;
       } else {
-        console.warn('[ws] unsupported message type', typeof message);
+        console.warn(`[ws] Unsupported message type: ${typeof message} from peer ${ws.peerId}`);
         return;
       }
-      console.log(`[ws] recv len=${buffer.length}`);
+
       ws.lastSeen = Date.now();
       const header = parseHeader(buffer);
-      if (!header) {
-        console.error('[ws] parseHeader failed, raw hex=', buffer.toString('hex'));
-        return;
-      }
-      console.log(`[ws] header from=${header.fromPeerId} to=${header.toPeerId} type=${header.packetType} len=${header.len}`);
+      if (!header) { console.error('[ws] parseHeader failed'); return; }
       const payload = buffer.subarray(HEADER_SIZE);
+
       switch (header.packetType) {
         case PacketType.HandShake:
-          console.log(`[ws] -> handleHandshake payload hex=${payload.toString('hex')}`);
           handleHandshake(ws, header, payload, this.types);
           break;
         case PacketType.Ping:
@@ -94,49 +91,39 @@ export class RelayRoom {
           this._handlePong(ws);
           break;
         case PacketType.RpcReq:
-          if (header.toPeerId !== PacketType.Invalid && header.toPeerId !== undefined && header.toPeerId !== null && header.toPeerId !== 0 && header.toPeerId !== PacketType.Invalid && header.toPeerId !== undefined && header.toPeerId !== null && header.toPeerId !== 0 && header.toPeerId !== PacketType.Invalid) {
-            // fallthrough handled below; guard keeps eslint quiet
-          }
-          if (header.toPeerId === PacketType.Invalid /* never true */) {
-            // no-op
-          }
-          if (header.toPeerId === undefined || header.toPeerId === null) {
+          if (header.toPeerId === undefined || header.toPeerId === null || header.toPeerId === MY_PEER_ID) {
             handleRpcReq(ws, header, payload, this.types);
-            break;
+          } else {
+            handleForwarding(ws, header, buffer, this.types);
           }
-          if (header.toPeerId === MY_PEER_ID) {
-            handleRpcReq(ws, header, payload, this.types);
-            break;
-          }
-          handleForwarding(ws, header, buffer, this.types);
           break;
         case PacketType.RpcResp:
           if (header.toPeerId === undefined || header.toPeerId === null || header.toPeerId === MY_PEER_ID) {
             handleRpcResp(ws, header, payload, this.types);
-            break;
+          } else {
+            handleForwarding(ws, header, buffer, this.types);
           }
-          // If toPeerId is not MY_PEER_ID, forward to the target peer
-          if (header.packetType !== PacketType.Data) {
-            console.log(`[ws] -> forward RpcResp type=${header.packetType} from=${header.fromPeerId} to=${header.toPeerId} len=${payload.length}`);
-          }
-          handleForwarding(ws, header, buffer, this.types);
           break;
         case PacketType.Data:
         default:
-          if (header.packetType !== PacketType.Data) {
-            console.log(`[ws] -> forward type=${header.packetType} len=${payload.length}`);
-          }
           handleForwarding(ws, header, buffer, this.types);
       }
     } catch (e) {
-      console.error('relay_room message handling error:', e);
-      // 不立即关闭连接，只记录错误
-      // 连接稳定性比单个消息处理失败更重要
+      console.error('[RelayRoom] Message handling error:', e);
     }
   }
 
-  async webSocketClose(ws) {
-    // 【修复】：加入防抖锁，防止风暴
+  async webSocketClose(ws) { this._cleanup(ws); }
+  async webSocketError(ws)  { this._cleanup(ws); }
+
+  /**
+   * _cleanup — 统一断线清理 (含防抖锁)。
+   *
+   * [M1] removeNetworkGroupActivity 提前到 peerId 守卫之前:
+   *      握手已完成 (groupKey 已设) 但断线时, 不论 peerId 是否存在都需要恢复 peerCount。
+   *      (注: 实际上 groupKey 和 peerId 总是同时设置, 此修复属防御性设计。)
+   */
+  _cleanup(ws) {
     if (ws.isCleanedUp) return;
     ws.isCleanedUp = true;
 
@@ -144,75 +131,66 @@ export class RelayRoom {
       clearInterval(ws.heartbeatInterval);
       ws.heartbeatInterval = null;
     }
-    
-    if (ws.peerId) {
-      const groupKey = ws.groupKey;
-      const removed = this.peerManager.removePeer(ws);
-      if (removed) {
-        try {
-          // 【修复】：强制携带 forceFull: true 广播，强推给所有存活节点
-          this.peerManager.broadcastRouteUpdate(this.types, groupKey, null, { forceFull: true });
-        } catch (_) { }
-      }
-      
-      if (groupKey && typeof removeNetworkGroupActivity === 'function') {
-        try {
-          removeNetworkGroupActivity(groupKey);
-        } catch (e) {
-          console.error('Error removing network group activity:', e);
-        }
-      }
+
+    // [M1] 提前执行, 不依赖 peerId
+    if (ws.groupKey) {
+      try { removeNetworkGroupActivity(ws.groupKey); }
+      catch (e) { console.error('[Cleanup] removeNetworkGroupActivity error:', e); }
+    }
+
+    if (!ws.peerId) return;
+
+    const groupKey = ws.groupKey;
+    const removed  = this.peerManager.removePeer(ws);
+    if (removed) {
+      try { this.peerManager.broadcastRouteUpdate(this.types, groupKey, null, { forceFull: true }); }
+      catch (_) {}
     }
   }
 
-  async webSocketError(ws) {
-    await this.webSocketClose(ws);
-  }
-
   _initSocket(ws, meta = {}) {
-    ws.peerId = meta.peerId || null;
-    ws.groupKey = meta.groupKey || null;
-    ws.domainName = meta.domainName || null;
-    ws.lastSeen = Date.now();
-    ws.lastPingSent = 0;
-    // 【修复】：初始化为当前时间，避免 0 值导致的永久免死金牌
-    ws.lastPongReceived = Date.now();
-    ws.serverSessionId = meta.serverSessionId || randomU64String();
-    ws.weAreInitiator = false;
-    ws.crypto = { enabled: false };
+    ws.peerId           = meta.peerId          || null;
+    ws.groupKey         = meta.groupKey        || null;
+    ws.domainName       = meta.domainName      || null;
+    ws.lastSeen         = Date.now();
+    ws.lastPingSent     = 0;
+    ws.lastPongReceived = Date.now(); // 初始化为当前时间, 避免 0 值导致立即超时
+    ws.serverSessionId  = meta.serverSessionId || randomU64String();
+    ws.weAreInitiator   = false;
+    ws.crypto           = { enabled: false };
     ws.heartbeatInterval = null;
+    ws.isCleanedUp      = false;
+
+    // [ws._env] CF env 绑定, 供 basic_handlers / crypto / rpc_handler 读取配置
+    ws._env = this.env;
+
     ws.serializeAttachment?.({
-      peerId: ws.peerId,
-      groupKey: ws.groupKey,
-      domainName: ws.domainName,
+      peerId:          ws.peerId,
+      groupKey:        ws.groupKey,
+      domainName:      ws.domainName,
       serverSessionId: ws.serverSessionId,
     });
-    
-    // 启动心跳机制
+
     this._startHeartbeat(ws);
   }
 
   _restoreSocket(ws) {
     const meta = ws.deserializeAttachment ? (ws.deserializeAttachment() || {}) : {};
     this._initSocket(ws, meta);
-    
-    if (ws.peerId && ws.groupKey) {
-      this.peerManager.addPeer(ws.peerId, ws);
-    }
+    if (ws.peerId && ws.groupKey) this.peerManager.addPeer(ws.peerId, ws);
   }
 
+  /**
+   * [HB-env] 从 CF env 读取心跳参数。
+   * 原版硬编码 10000/25000ms, 即使 wrangler.toml 配置了对应变量也无效。
+   */
   _startHeartbeat(ws) {
-    if (ws.heartbeatInterval) {
-      clearInterval(ws.heartbeatInterval);
-    }
-    
-    // 缩短超时判定周期，提升列表刷新速度
-    const heartbeatInterval = 10000;
-    const connectionTimeout = 25000;
-    const checkInterval = 5000;
-    
-    console.log(`[heartbeat] Starting heartbeat for peer ${ws.peerId}`);
-    
+    if (ws.heartbeatInterval) clearInterval(ws.heartbeatInterval);
+    const env               = this.env || {};
+    const heartbeatInterval = Number(env.EASYTIER_HEARTBEAT_INTERVAL || 10_000);
+    const connectionTimeout = Number(env.EASYTIER_CONNECTION_TIMEOUT  || 25_000);
+    const checkInterval     = Math.min(5_000, Math.floor(heartbeatInterval / 2));
+
     ws.heartbeatInterval = setInterval(() => {
       try {
         if (ws.readyState === WS_OPEN) {
@@ -221,38 +199,30 @@ export class RelayRoom {
             this._sendPing(ws);
             ws.lastPingSent = now;
           }
-          
-          // 【修复】：删掉原版错误的 > 0 判断，超时后主动触发全局网络清理
           if (now - ws.lastPongReceived > connectionTimeout) {
-            console.log(`[heartbeat] Connection timeout for peer ${ws.peerId}, forcing cleanup`);
-            this.webSocketClose(ws);
-            try { ws.close(); } catch(_) {}
-            return;
+            console.log(`[Heartbeat] Timeout for peer ${ws.peerId}, forcing cleanup`);
+            this._cleanup(ws);
+            try { ws.close(); } catch (_) {}
           }
         } else {
-          this.webSocketClose(ws);
+          this._cleanup(ws);
         }
-      } catch (e) {
-        console.error('[heartbeat] Error in heartbeat interval:', e);
-      }
+      } catch (e) { console.error('[Heartbeat] Error:', e); }
     }, checkInterval);
   }
 
+  /**
+   * [M3] 握手未完成 (!ws.peerId) 时跳过, 避免向 toPeerId=0/null 发噪音包。
+   */
   _sendPing(ws) {
     try {
-      if (ws.readyState === WS_OPEN) {
-        const pingData = Buffer.from('ping');
-        const header = createHeader(MY_PEER_ID, ws.peerId, PacketType.Ping, pingData.length);
-        ws.send(Buffer.concat([header, pingData]));
-        console.log(`[heartbeat] Sent ping to peer ${ws.peerId}`);
-      }
-    } catch (e) {
-      console.error(`[heartbeat] Failed to send ping to peer ${ws.peerId}:`, e);
-    }
+      if (ws.readyState !== WS_OPEN) return;
+      if (!ws.peerId) return; // [M3]
+      const pingData = Buffer.from('ping');
+      const header   = createHeader(MY_PEER_ID, ws.peerId, PacketType.Ping, pingData.length);
+      ws.send(Buffer.concat([header, pingData]));
+    } catch (e) { console.error(`[Heartbeat] Ping failed to peer ${ws.peerId}:`, e); }
   }
 
-  _handlePong(ws) {
-    ws.lastPongReceived = Date.now();
-    console.log(`[heartbeat] Received pong from peer ${ws.peerId}`);
-  }
+  _handlePong(ws) { ws.lastPongReceived = Date.now(); }
 }
