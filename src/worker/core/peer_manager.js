@@ -13,12 +13,10 @@
  */
 
 import { Buffer } from 'buffer';
-import { MY_PEER_ID, PacketType } from './constants.js';
+import { MY_PEER_ID, PacketType, WS_OPEN } from './constants.js';
 import { createHeader } from './packet.js';
 import { wrapPacket, randomU64String } from './crypto.js';
 import { getPeerCenterState, cleanPeerAndSubPeers } from './global_state.js';
-
-const WS_OPEN = 1;
 
 // ── 工具函数 ──────────────────────────────────────────────────────────────────
 
