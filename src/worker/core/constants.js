@@ -3,6 +3,8 @@ export const VERSION    = 1;
 export const MY_PEER_ID = 10000001;
 export const HEADER_SIZE = 16;
 
+export const WS_OPEN = (typeof WebSocket !== 'undefined' && WebSocket.OPEN) ? WebSocket.OPEN : 1;
+
 export const PacketType = {
   Invalid:              0,
   Data:                 1,
