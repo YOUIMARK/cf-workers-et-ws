@@ -24,7 +24,7 @@ export function parseHeader(buffer) {
  * LATENCY_FIRST 标志由 wrapPacket 通过 applyLatencyFirstFlag 在合并后统一注入。
  */
 export function createHeader(fromPeerId, toPeerId, packetType, payloadLen, flags = 0, forwardCounter = 1) {
-  const buf = Buffer.alloc(HEADER_SIZE);
+  const buf = Buffer.allocUnsafe(HEADER_SIZE);
   buf.writeUInt32LE(fromPeerId,    0);
   buf.writeUInt32LE(toPeerId,      4);
   buf.writeUInt8(packetType,       8);

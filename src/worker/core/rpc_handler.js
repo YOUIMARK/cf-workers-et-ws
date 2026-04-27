@@ -1,4 +1,4 @@
-import { MY_PEER_ID, PacketType } from './constants.js';
+import { MY_PEER_ID, PacketType, WS_OPEN } from './constants.js';
 import { createHeader } from './packet.js';
 import { getPeerManager } from './peer_manager.js';
 import { wrapPacket, randomU64String } from './crypto.js';
@@ -26,10 +26,29 @@ function toLongForProto(value) {
 
 function pm() { return getPeerManager(); }
 
+// ── 解压缩辅助函数 ─────────────────────────────────────────────────────────────
+
+/**
+ * 尝试解压 RPC 包体。仅在压缩算法 > 1 且 zlib 可用时执行。
+ * 解压成功后重置 algo 为 1 (无压缩), 使下游统一处理。
+ * @returns {boolean} false 表示解压失败, 调用方应中止处理
+ */
+function decompressRpcBody(rpcPacket, peerIdLabel) {
+  if (!(rpcPacket.compressionInfo?.algo > 1 && isCompressionAvailable())) return true;
+  try {
+    rpcPacket.body = gunzipMaybe(rpcPacket.body);
+    rpcPacket.compressionInfo.algo = 1;
+    return true;
+  } catch (e) {
+    console.error(`RPC decompress failed from ${peerIdLabel}: ${e.message}`);
+    return false;
+  }
+}
+
 // ── RPC 响应发送 ──────────────────────────────────────────────────────────────
 
 function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes) {
-  if (!ws || ws.readyState !== 1) {
+  if (!ws || ws.readyState !== WS_OPEN) {
     console.error(`sendRpcResponse aborted: socket not open, toPeer=${toPeerId}`);
     return;
   }
@@ -76,10 +95,7 @@ export function handleRpcReq(ws, header, payload, types) {
   try {
     const rpcPacket = types.RpcPacket.decode(payload);
 
-    if (rpcPacket.compressionInfo?.algo > 1 && isCompressionAvailable()) {
-      try { rpcPacket.body = gunzipMaybe(rpcPacket.body); rpcPacket.compressionInfo.algo = 1; }
-      catch (e) { console.error(`RpcPacket decompress failed from ${header.fromPeerId}: ${e.message}`); return; }
-    }
+    if (!decompressRpcBody(rpcPacket, header.fromPeerId)) return;
 
     const descriptor = rpcPacket.descriptor;
     let innerReqBody = rpcPacket.body;
@@ -158,10 +174,7 @@ export function handleRpcResp(ws, header, payload, types) {
   try {
     const rpcPacket = types.RpcPacket.decode(payload);
 
-    if (rpcPacket.compressionInfo?.algo > 1 && isCompressionAvailable()) {
-      try { rpcPacket.body = gunzipMaybe(rpcPacket.body); rpcPacket.compressionInfo.algo = 1; }
-      catch (e) { console.error(`RpcResp decompress failed from ${header.fromPeerId}: ${e.message}`); return; }
-    }
+    if (!decompressRpcBody(rpcPacket, header.fromPeerId)) return;
 
     const descriptor = rpcPacket.descriptor || {};
     let rpcRespBody  = rpcPacket.body;

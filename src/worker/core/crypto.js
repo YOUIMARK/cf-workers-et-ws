@@ -87,6 +87,7 @@ export function deriveKeys(networkSecret = '') {
 export function generateDigestFromStr(str1, str2, digestLen = 32) {
   const len = Number(digestLen);
   if (!Number.isInteger(len) || len <= 0 || (len % 8) !== 0) throw new Error('digest length must be multiple of 8');
+  if (len > 1024) throw new Error('digest length exceeds maximum of 1024');
   const h = new DefaultHasher();
   h.write(Buffer.from(String(str1 || ''), 'utf8'));
   h.write(Buffer.from(String(str2 || ''), 'utf8'));
