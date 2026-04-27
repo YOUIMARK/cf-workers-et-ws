@@ -14,12 +14,14 @@
  * [BC] broadcastRouteUpdate 失败后使用 forceFull:false, 避免高频失败时广播风暴。
  */
 
-import { MAGIC, VERSION, MY_PEER_ID, PacketType } from './constants.js';
+import { MAGIC, VERSION, MY_PEER_ID, PacketType, WS_OPEN } from './constants.js';
 import { createHeader } from './packet.js';
 import { getPeerManager } from './peer_manager.js';
 import { wrapPacket, randomU64String } from './crypto.js';
 
-const WS_OPEN = (typeof WebSocket !== 'undefined' && WebSocket.OPEN) ? WebSocket.OPEN : 1;
+function getGroupKey(ws) {
+  return (ws && ws.groupKey) ? String(ws.groupKey) : '';
+}
 
 /** networkName -> Set<digestHex> */
 const networkDigestRegistry = new Map();
@@ -28,13 +30,13 @@ const networkGroups = new Map();
 
 export function updateNetworkGroupActivity(groupKey) {
   const g = networkGroups.get(groupKey);
-  if (g) { g.lastActivity = Date.now(); g.peerCount = (g.peerCount || 0) + 1; }
+  if (g) { g.lastActivity = Date.now(); g.peerCount = (g.peerCount ?? 0) + 1; }
 }
 
 export function removeNetworkGroupActivity(groupKey) {
   const g = networkGroups.get(groupKey);
   if (!g) return;
-  g.peerCount = Math.max(0, (g.peerCount || 1) - 1);
+  g.peerCount = Math.max(0, (g.peerCount ?? 1) - 1);
   if (g.peerCount === 0 && Date.now() - g.lastActivity > 24 * 60 * 60 * 1000) {
     networkGroups.delete(groupKey);
     // [NR] 同步清理 networkDigestRegistry, 防止无界内存积累
@@ -197,11 +199,11 @@ export function handlePing(ws, header, payload) {
  */
 export function handleForwarding(sourceWs, header, fullMessage, types) {
   const pm       = getPeerManager();
-  const targetWs = pm.getPeerWs(header.toPeerId, sourceWs && sourceWs.groupKey);
+  const targetWs = pm.getPeerWs(header.toPeerId, getGroupKey(sourceWs));
   if (!targetWs || targetWs.readyState !== WS_OPEN) return;
 
-  const srcGroup = sourceWs && sourceWs.groupKey;
-  const dstGroup = targetWs.groupKey;
+  const srcGroup = getGroupKey(sourceWs);
+  const dstGroup = getGroupKey(targetWs);
   if (srcGroup && dstGroup && srcGroup !== dstGroup) {
     console.warn(`[Forward] Cross-group blocked: ${srcGroup} -> ${dstGroup}`);
     return;
@@ -217,11 +219,14 @@ export function handleForwarding(sourceWs, header, fullMessage, types) {
       targetWs.heartbeatInterval = null;
     }
     targetWs.isCleanedUp = true;
-    if (targetWs.groupKey) {
-      try { removeNetworkGroupActivity(targetWs.groupKey); } catch (_) {}
+    if (dstGroup) {
+      try { removeNetworkGroupActivity(dstGroup); } catch (_) {}
     }
     pm.removePeer(targetWs);
     // [BC] forceFull:false — removePeer 已 bumpAllPeerConnVersions, 增量更新即可
-    try { pm.broadcastRouteUpdate(types, srcGroup, null, { forceFull: false }); } catch (_) {}
+    // [M1-fix] 使用 dstGroup 而非 srcGroup: 转发失败意味着目标 peer 失效, 应通知目标所在组
+    if (dstGroup) {
+      try { pm.broadcastRouteUpdate(types, dstGroup, null, { forceFull: false }); } catch (_) {}
+    }
   }
 }
