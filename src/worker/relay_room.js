@@ -13,7 +13,7 @@
 
 import { Buffer } from 'buffer';
 import { parseHeader, createHeader } from './core/packet.js';
-import { PacketType, HEADER_SIZE, MY_PEER_ID } from './core/constants.js';
+import { PacketType, HEADER_SIZE, MY_PEER_ID, WS_OPEN } from './core/constants.js';
 import { loadProtos } from './core/protos.js';
 import {
   handleHandshake, handlePing, handleForwarding,
@@ -22,8 +22,6 @@ import {
 import { handleRpcReq, handleRpcResp } from './core/rpc_handler.js';
 import { getPeerManager } from './core/peer_manager.js';
 import { randomU64String } from './core/crypto.js';
-
-const WS_OPEN = (typeof WebSocket !== 'undefined' && WebSocket.OPEN) ? WebSocket.OPEN : 1;
 
 export class RelayRoom {
   constructor(state, env) {
