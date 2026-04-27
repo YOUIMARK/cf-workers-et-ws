@@ -195,10 +195,12 @@ export function handleRpcResp(ws, header, payload, types) {
 // ── handleSyncRouteInfo ───────────────────────────────────────────────────────
 
 function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
-  const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
+  const groupKey = (ws && ws.groupKey) ? String(ws.groupKey) : '';
   if (!ws.serverSessionId) ws.serverSessionId = randomU64String();
   if (typeof syncReq.isInitiator === 'boolean') ws.weAreInitiator = !syncReq.isInitiator;
-  pm().onRouteSessionAck(groupKey, fromPeerId, syncReq.mySessionId, ws.weAreInitiator);
+
+  const peerMgr = pm();
+  peerMgr.onRouteSessionAck(groupKey, fromPeerId, syncReq.mySessionId, ws.weAreInitiator);
 
   let hasNewPeers = false;
   let hasSubPeers = false;
@@ -208,8 +210,8 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
 
     // [Bug1] isNew 检查必须在 updatePeerInfo 写入之前; 原版写入后再检查永远为 true
     // [Bug2] listPeerIdsInGroup 和 Set 构造提到循环外, 避免 O(n²)
-    const existingInfos  = pm()._getPeerInfosMap(groupKey, false);
-    const directSet      = new Set(pm().listPeerIdsInGroup(groupKey));
+    const existingInfos  = peerMgr._getPeerInfosMap(groupKey, false);
+    const directSet      = new Set(peerMgr.listPeerIdsInGroup(groupKey));
     // [R4] 在第一次遍历中收集 subPeerEntries, 消除第二次遍历
     const subPeerEntries = {};
 
@@ -225,7 +227,7 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
           console.log(`[SyncRoute] Sub-peer ${info.peerId} via ${fromPeerId}`);
         }
       }
-      pm().updatePeerInfo(groupKey, info.peerId, info);
+      peerMgr.updatePeerInfo(groupKey, info.peerId, info);
     }
 
     if (hasSubPeers && Object.keys(subPeerEntries).length > 0) {
@@ -245,11 +247,11 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
     console.error(`CRITICAL: SyncRouteInfoResponse send failed to ${fromPeerId}: ${e.message}`);
   }
 
-  try { pm().pushRouteUpdateTo(fromPeerId, ws, types, { forceFull: true }); }
+  try { peerMgr.pushRouteUpdateTo(fromPeerId, ws, types, { forceFull: true }); }
   catch (e) { console.error(`pushRouteUpdateTo ${fromPeerId} failed:`, e); }
 
   if (hasNewPeers || hasSubPeers) {
-    try { pm().broadcastRouteUpdate(types, groupKey, fromPeerId, { forceFull: true }); }
+    try { peerMgr.broadcastRouteUpdate(types, groupKey, fromPeerId, { forceFull: true }); }
     catch (e) { console.error(`broadcastRouteUpdate for ${groupKey} failed:`, e); }
   }
 }
