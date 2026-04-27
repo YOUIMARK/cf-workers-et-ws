@@ -63,7 +63,7 @@ export class RelayRoom {
       let buffer;
       if      (message instanceof ArrayBuffer)                       buffer = Buffer.from(message);
       else if (message instanceof Uint8Array)                        buffer = Buffer.from(message);
-      else if (ArrayBuffer.isView(message) && message.buffer)        buffer = Buffer.from(message.buffer);
+      else if (ArrayBuffer.isView(message) && message.buffer)        buffer = Buffer.from(message.buffer, message.byteOffset || 0, message.byteLength || message.buffer.byteLength);
       else if (typeof message === 'string') {
         // EasyTier 协议仅使用二进制帧; 文本帧表示客户端配置有误
         console.warn(`[ws] TEXT frame from peer ${ws.peerId} — EasyTier uses binary frames only`);
